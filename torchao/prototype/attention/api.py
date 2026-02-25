@@ -28,6 +28,78 @@ from torchao.prototype.attention.utils import (
 )
 
 
+class _LowPrecisionAttentionWrapper(nn.Module):
+    """Opaque wrapper around a compiled low-precision attention module.
+
+    This wrapper prevents ``torch.compile`` from tracing through the inner
+    compiled module (via ``@torch._dynamo.disable`` on ``forward``), creating
+    a graph-break boundary that preserves the internal compilation with the
+    fusion pass.
+
+    .. note::
+
+        The caller is responsible for activating the appropriate flash
+        attention implementation **before** invoking the wrapper.  For
+        example::
+
+            from torch.nn.attention import (
+                activate_flash_attention_impl,
+                restore_flash_attention_impl,
+            )
+
+            activate_flash_attention_impl("FA4")  # or "FA3"
+            try:
+                output = wrapped_model(inputs)
+            finally:
+                restore_flash_attention_impl()
+
+        If the implementation is not activated, PyTorch will raise a clear
+        error at the CUDA dispatch level.
+
+    The wrapper proxies attribute access to the original (uncompiled)
+    module, so model-specific attributes (e.g., ``config``) remain
+    accessible.  ``_orig_mod`` is registered as a submodule so that
+    ``to()``, ``cuda()``, ``eval()``, ``parameters()``, etc. propagate
+    correctly through the standard ``nn.Module`` machinery.
+    """
+
+    def __init__(
+        self,
+        compiled_mod: nn.Module,
+        orig_mod: nn.Module,
+        flash_impl_name: str,
+    ):
+        super().__init__()
+        # Registered as a submodule so nn.Module traversal methods
+        # (parameters, to, eval, ...) reach the real weights.
+        self._orig_mod = orig_mod
+        # Stored outside _modules to avoid double-counting parameters
+        # (the compiled module wraps the same _orig_mod).
+        object.__setattr__(self, "_compiled_mod", compiled_mod)
+        object.__setattr__(self, "_flash_impl_name", flash_impl_name)
+
+    # ------------------------------------------------------------------
+    # Attribute proxy
+    # ------------------------------------------------------------------
+
+    def __getattr__(self, name: str):
+        # nn.Module.__getattr__ checks _parameters, _buffers, _modules.
+        # If the attribute is not found there, proxy to the original module.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._orig_mod, name)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    @torch._dynamo.disable
+    def forward(self, *args, **kwargs):
+        compiled_mod = object.__getattribute__(self, "_compiled_mod")
+        return compiled_mod(*args, **kwargs)
+
+
 def apply_low_precision_attention(
     model: nn.Module,
     config: Optional[LowPrecisionAttentionConfig] = None,
@@ -37,9 +109,26 @@ def apply_low_precision_attention(
 
     Compiles the model with a custom backend that fuses
     RoPE + FP8 quantization + SDPA into optimized kernels.  The
-    returned module is fully encapsulated: no global state is modified,
-    and the caller does **not** need to call ``torch.compile`` or
-    ``activate_flash_attention_impl`` separately.
+    returned module is compiled and wrapped but **does not** manage
+    flash attention activation.  The caller **must** activate the
+    appropriate flash attention implementation before each forward
+    call and restore it afterwards::
+
+        from torch.nn.attention import (
+            activate_flash_attention_impl,
+            restore_flash_attention_impl,
+        )
+
+        model = apply_low_precision_attention(model, config)
+
+        activate_flash_attention_impl("FA4")  # or "FA3"
+        try:
+            output = model(inputs)
+        finally:
+            restore_flash_attention_impl()
+
+    If the implementation is not activated, PyTorch will raise a clear
+    error at the CUDA dispatch level.
 
     The returned wrapper creates a graph-break boundary, so if the
     caller later applies ``torch.compile`` to a parent model, the inner
@@ -65,12 +154,27 @@ def apply_low_precision_attention(
 
     Example::
 
+        from torch.nn.attention import (
+            activate_flash_attention_impl,
+            restore_flash_attention_impl,
+        )
         from torchao.prototype.attention import apply_low_precision_attention
 
         model = MyTransformer()
         model = apply_low_precision_attention(model)
-        output = model(inputs)  # First call triggers compilation
+
+        activate_flash_attention_impl("FA4")
+        try:
+            output = model(inputs)  # First call triggers compilation
+        finally:
+            restore_flash_attention_impl()
     """
+    # Guard: already wrapped.
+    if isinstance(model, _LowPrecisionAttentionWrapper):
+        raise RuntimeError(
+            "apply_low_precision_attention has already been applied to this module."
+        )
+
     # Guard: already compiled.
     if isinstance(model, torch._dynamo.OptimizedModule):
         raise RuntimeError(
@@ -89,17 +193,13 @@ def apply_low_precision_attention(
         _check_backend_available(backend)
 
     if backend == AttentionBackend.FP8_FA3:
-        from torchao.prototype.attention.fp8_fa3.setup import (
-            _LowPrecisionAttentionWrapper,
-            setup_fp8_fa3,
-        )
-
-        # Guard: already wrapped.
-        if isinstance(model, _LowPrecisionAttentionWrapper):
-            raise RuntimeError(
-                "apply_low_precision_attention has already been applied to this module."
-            )
+        from torchao.prototype.attention.fp8_fa3.setup import setup_fp8_fa3
 
         return setup_fp8_fa3(model, config)
+
+    if backend == AttentionBackend.FP8_FA4:
+        from torchao.prototype.attention.fp8_fa4.setup import setup_fp8_fa4
+
+        return setup_fp8_fa4(model, config)
 
     raise ValueError(f"Unknown backend: {backend}")

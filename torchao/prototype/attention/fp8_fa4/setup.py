@@ -5,11 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-FP8 FA3 backend setup: compilation, wrapping, and causal-mask pre-flight.
+FP8 FA4 backend setup: compilation, wrapping, and causal-mask pre-flight.
 
-This module contains all FP8-FA3-specific logic for compiling a model with
+This module contains all FP8-FA4-specific logic for compiling a model with
 the RoPE + FP8 fusion pass and wrapping it for inference.  The public entry
-point is ``setup_fp8_fa3``, called by the backend-agnostic dispatcher in
+point is ``setup_fp8_fa4``, called by the backend-agnostic dispatcher in
 ``torchao.prototype.attention.api``.
 """
 
@@ -24,11 +24,11 @@ from torchao.prototype.attention.api import _LowPrecisionAttentionWrapper
 from torchao.prototype.attention.config import LowPrecisionAttentionConfig
 
 
-def setup_fp8_fa3(
+def setup_fp8_fa4(
     model: nn.Module,
     config: LowPrecisionAttentionConfig,
 ) -> nn.Module:
-    """Compile *model* with the RoPE + FP8 fusion pass (FA3) and wrap it."""
+    """Compile *model* with the RoPE + FP8 fusion pass (FA4) and wrap it."""
     if config.use_hadamard == "qkv":
         raise NotImplementedError(
             "FP8 attention with Hadamard on QKV is not yet implemented."
@@ -40,12 +40,12 @@ def setup_fp8_fa3(
 
     from torch._inductor.compile_fx import compile_fx
 
-    from torchao.prototype.attention.fp8_fa3.fusion_pass import (
+    from torchao.prototype.attention.fp8_fa4.fusion_pass import (
         rope_sdpa_fusion_pass,
     )
     from torchao.prototype.attention.fusion_utils import detect_causal_mask
 
-    strip_causal_mask = detect_causal_mask(model, flash_impl_name="FA3")
+    strip_causal_mask = detect_causal_mask(model, flash_impl_name="FA4")
 
     pass_fn = partial(
         rope_sdpa_fusion_pass,
@@ -68,4 +68,4 @@ def setup_fp8_fa3(
     # Compile with our custom backend (fusion pass is baked in).
     compiled = torch.compile(model, backend=fp8_attention_backend)
 
-    return _LowPrecisionAttentionWrapper(compiled, model, flash_impl_name="FA3")
+    return _LowPrecisionAttentionWrapper(compiled, model, flash_impl_name="FA4")
