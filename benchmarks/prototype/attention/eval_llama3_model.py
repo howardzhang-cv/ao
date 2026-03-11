@@ -57,6 +57,17 @@ BACKENDS = {
         "fp8_backend": AttentionBackend.FP8_FA3,
         "label": "FA3 FP8",
     },
+    "fa4": {
+        "flash_impl": "FA4",
+        "fp8": False,
+        "label": "FA4 BF16",
+    },
+    "fa4_fp8": {
+        "flash_impl": "FA4",
+        "fp8": True,
+        "fp8_backend": AttentionBackend.FP8_FA4,
+        "label": "FA4 FP8",
+    },
 }
 
 RANDOM_SEED = 42
